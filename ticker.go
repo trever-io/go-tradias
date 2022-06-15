@@ -15,13 +15,6 @@ type LiquidityBook struct {
 	Buys  [][]string
 }
 
-type subscribeMessage struct {
-	Type        string `json:"type"`
-	ChannelName string `json:"channelname"`
-	Instrument  string `json:"instrument"`
-	Heartbeat   bool   `json:"heartbeat"`
-}
-
 type TickerEntry struct {
 	Quantity decimal.Decimal `json:"quantity"`
 	Price    decimal.Decimal `json:"price"`
@@ -32,43 +25,17 @@ type TickerResponse struct {
 	Sell []TickerEntry `json:"sell"`
 }
 
-type websocketResponse struct {
-	Event  string         `json:"event"`
-	Type   string         `json:"type"`
-	Levels TickerResponse `json:"levels"`
-}
+const PRICES_CHANNEL_NAME = "prices"
 
-const TRADIAS_WEBSOCKET_CHANNEL = "wss://otcapp-uat.tradias.de/otc/ws"
-const TRADIAS_SUBSCRIPTION_TYPE = "subscribe"
-const TRADIAS_CHANNEL_NAME = "prices"
-const TRADIAS_HEARTBEAT_EVENT = "heartbeat"
-const TRADIAS_SUBSCRIPTION_TYPE_STATUS = "subscribed"
-
-func (a *APIClient) GetTicker(baseAsset string, quoteAsset string) (*LiquidityBook, error) {
-	header := map[string][]string{"x-token-id": {a.apiKey}}
-	conn, _, err := websocket.DefaultDialer.DialContext(context.TODO(), TRADIAS_WEBSOCKET_CHANNEL, header)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
+func (c *APIClient) GetTicker(ctx context.Context, baseAsset string, quoteAsset string) (*LiquidityBook, error) {
 	symbol := fmt.Sprintf("%v%v", baseAsset, quoteAsset)
 	sub := subscribeMessage{
 		Type:        TRADIAS_SUBSCRIPTION_TYPE,
-		ChannelName: TRADIAS_CHANNEL_NAME,
+		ChannelName: PRICES_CHANNEL_NAME,
 		Instrument:  symbol,
-		Heartbeat:   true,
 	}
 
-	err = conn.WriteJSON(sub)
-	if err != nil {
-		return nil, err
-	}
-
-	err = getSubscriptionResult(conn)
-	if err != nil {
-		return nil, err
-	}
+	conn, err := c.connect(ctx, &sub)
 
 	book, err := getLiquidityBookSnapshot(conn)
 	if err != nil {
@@ -79,39 +46,6 @@ func (a *APIClient) GetTicker(baseAsset string, quoteAsset string) (*LiquidityBo
 
 }
 
-func getSubscriptionResult(conn *websocket.Conn) error {
-	for {
-		fmt.Println("Receiving data from websocket...")
-		_, data, err := conn.ReadMessage()
-		if err == io.EOF {
-			return err
-		}
-		if err != nil {
-			fmt.Printf("error during websocket connection: %v\n", err)
-			return err
-		}
-
-		msg := new(websocketResponse)
-		err = json.Unmarshal(data, msg)
-		if err != nil {
-			return err
-		}
-
-		switch msg.Type {
-		case TRADIAS_HEARTBEAT_EVENT:
-			fallthrough
-		case TRADIAS_SUBSCRIPTION_TYPE:
-			continue
-		case TRADIAS_SUBSCRIPTION_TYPE_STATUS:
-			return nil
-		case "":
-			continue
-		default:
-			return fmt.Errorf("unhandled type: %v", msg.Type)
-		}
-	}
-}
-
 func getLiquidityBookSnapshot(conn *websocket.Conn) (*LiquidityBook, error) {
 	for {
 		_, data, err := conn.ReadMessage()
@@ -119,8 +53,9 @@ func getLiquidityBookSnapshot(conn *websocket.Conn) (*LiquidityBook, error) {
 			return nil, err
 		}
 		if err != nil {
-			fmt.Printf("error during websocket connection: %v\n", err)
-			return nil, err
+			tmp := fmt.Errorf("error during websocket connection: %w", err)
+			fmt.Println(tmp)
+			return nil, tmp
 		}
 
 		msg := new(websocketResponse)
@@ -129,8 +64,12 @@ func getLiquidityBookSnapshot(conn *websocket.Conn) (*LiquidityBook, error) {
 			return nil, err
 		}
 
+		if msg.Event == nil {
+			continue
+		}
+
 		var book *LiquidityBook
-		if msg.Event == "prices" {
+		if *msg.Event == "prices" {
 			buy := msg.Levels.Buy
 			sell := msg.Levels.Sell
 
@@ -138,8 +77,6 @@ func getLiquidityBookSnapshot(conn *websocket.Conn) (*LiquidityBook, error) {
 			sells := getLiquidityEntries(sell)
 
 			book = &LiquidityBook{Buys: buys, Sells: sells}
-		} else if msg.Event == "" {
-			continue
 		} else {
 			return nil, fmt.Errorf("unexpected event: %v", msg.Event)
 		}
