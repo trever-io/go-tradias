@@ -50,6 +50,7 @@ func (a *APIClient) GetTicker(baseAsset string, quoteAsset string) (*LiquidityBo
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
 	symbol := fmt.Sprintf("%v%v", baseAsset, quoteAsset)
 	sub := subscribeMessage{
@@ -61,19 +62,16 @@ func (a *APIClient) GetTicker(baseAsset string, quoteAsset string) (*LiquidityBo
 
 	err = conn.WriteJSON(sub)
 	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 
 	err = getSubscriptionResult(conn)
 	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 
 	book, err := getLiquidityBookSnapshot(conn)
 	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 
@@ -86,12 +84,10 @@ func getSubscriptionResult(conn *websocket.Conn) error {
 		fmt.Println("Receiving data from websocket...")
 		_, data, err := conn.ReadMessage()
 		if err == io.EOF {
-			conn.Close()
 			return err
 		}
 		if err != nil {
 			fmt.Printf("error during websocket connection: %v\n", err)
-			conn.Close()
 			return err
 		}
 
@@ -120,12 +116,10 @@ func getLiquidityBookSnapshot(conn *websocket.Conn) (*LiquidityBook, error) {
 	for {
 		_, data, err := conn.ReadMessage()
 		if err == io.EOF {
-			conn.Close()
 			return nil, err
 		}
 		if err != nil {
 			fmt.Printf("error during websocket connection: %v\n", err)
-			conn.Close()
 			return nil, err
 		}
 
