@@ -18,8 +18,8 @@ var (
 type Side string
 
 var (
-	Side_BUY  = "BUY"
-	Side_SELL = "SELL"
+	Side_BUY  Side = "BUY"
+	Side_SELL Side = "SELL"
 )
 
 const ORDERS_CHANNEL_NAME = "orders"
@@ -32,12 +32,15 @@ var (
 )
 
 type Order struct {
-	Instrument    string      `json:"instrument"`
-	OrderType     OrderType   `json:"order_type"`
-	Side          Side        `json:"side"`
-	Amount        json.Number `json:"amount"`
-	Currency      string      `json:"currency,omitempty"`
-	ClientOrderId string      `json:"client_order_id,omitempty"`
+	OrderId        string       `json:"order_id,omitempty"`
+	Instrument     string       `json:"instrument"`
+	OrderType      OrderType    `json:"order_type"`
+	Side           Side         `json:"side"`
+	Amount         json.Number  `json:"amount"`
+	Currency       string       `json:"currency,omitempty"`
+	ClientOrderId  string       `json:"client_order_id,omitempty"`
+	TradeId        *string      `json:"trade_id,omitempty"`
+	ConfirmedPrice *json.Number `json:"confirmed_price,omitempty"`
 
 	// for internal use only
 	InternalClientOrderId string `json:"client_order_id_1"`

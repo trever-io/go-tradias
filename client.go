@@ -24,25 +24,38 @@ type createOrderRequest struct {
 	order *Order
 }
 
+type allOrderSubscription struct {
+	cb  chan<- *Order
+	ctx context.Context
+}
+
 type APIClient struct {
+	apiUrl string
 	apiKey string
 
-	createOrderChan chan *createOrderRequest
+	createOrderChan        chan *createOrderRequest
+	subscribeAllOrdersChan chan *allOrderSubscription
 }
 
 const (
-	TRADIAS_WEBSOCKET_CHANNEL        = "wss://otcapp-uat.tradias.de/otc/ws"
-	TRADIAS_SUBSCRIPTION_TYPE        = "subscribe"
-	TRADIAS_SUBSCRIPTION_TYPE_STATUS = "subscribed"
-	TRADIAS_HEARTBEAT_EVENT          = "heartbeat"
+	TRADIAS_WEBSOCKET_CHANNEL         = "wss://otcapp.tradias.de/otc/ws"
+	TRADIAS_WEBSOCKET_CHANNEL_SANDBOX = "wss://otcapp-sandbox.tradias.de/otc/ws"
+	TRADIAS_SUBSCRIPTION_TYPE         = "subscribe"
+	TRADIAS_SUBSCRIPTION_TYPE_STATUS  = "subscribed"
+	TRADIAS_HEARTBEAT_EVENT           = "heartbeat"
 )
 
 func NewClient(apiKey string) *APIClient {
 	c := &APIClient{
+		apiUrl: TRADIAS_WEBSOCKET_CHANNEL,
 		apiKey: apiKey,
 	}
 
 	return c
+}
+
+func (c *APIClient) Sandbox() {
+	c.apiUrl = TRADIAS_WEBSOCKET_CHANNEL_SANDBOX
 }
 
 type subscribeMessage struct {
@@ -56,7 +69,6 @@ type websocketResponse struct {
 	Type                  string          `json:"type"`
 	Event                 *string         `json:"event"`
 	Levels                *TickerResponse `json:"levels"`
-	Order                 *Order          `json:"order"`
 	Message               *string         `json:"message"`
 	ClientOrderId         *string         `json:"client_order_id"`
 	InternalClientOrderId *string         `json:"client_order_id_1"`
@@ -69,7 +81,7 @@ type websocketRequest struct {
 
 func (c *APIClient) connect(ctx context.Context, msg *subscribeMessage) (*websocket.Conn, error) {
 	header := map[string][]string{"x-token-id": {c.apiKey}}
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, TRADIAS_WEBSOCKET_CHANNEL, header)
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.apiUrl, header)
 	if err != nil {
 		return nil, err
 	}
@@ -137,18 +149,43 @@ func (c *APIClient) StartOrderChannel(ctx context.Context) error {
 
 	msgChan := make(chan *subOut, 1)
 	c.createOrderChan = make(chan *createOrderRequest, 1)
+	c.subscribeAllOrdersChan = make(chan *allOrderSubscription, 1)
 
-	go handleOrderRequests(ctx, conn, c.createOrderChan, msgChan)
+	go handleOrderRequests(ctx, conn, c.createOrderChan, c.subscribeAllOrdersChan, msgChan)
 	go listenToSocket(conn, msgChan)
 
 	return nil
 }
 
-func handleOrderRequests(ctx context.Context, conn *websocket.Conn, createOrderChan <-chan *createOrderRequest, msgReceived <-chan *subOut) {
+func (c *APIClient) SubscribeAllOrders(ctx context.Context) (<-chan *Order, error) {
+	result := make(chan *Order, 1)
+
+	sub := &allOrderSubscription{
+		ctx: ctx,
+		cb:  result,
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case c.subscribeAllOrdersChan <- sub:
+	}
+
+	return result, nil
+}
+
+func handleOrderRequests(ctx context.Context, conn *websocket.Conn, createOrderChan <-chan *createOrderRequest, subscriptionChan <-chan *allOrderSubscription, msgReceived <-chan *subOut) {
 	defer conn.Close()
 
 	// create timeout
 	requests := make(map[string]*createOrderRequest)
+
+	subscriptions := make([]*allOrderSubscription, 0)
+	defer func() {
+		for _, sub := range subscriptions {
+			close(sub.cb)
+		}
+	}()
 
 	// drain receive channel
 	defer func() {
@@ -170,7 +207,6 @@ func handleOrderRequests(ctx context.Context, conn *websocket.Conn, createOrderC
 				return
 			}
 
-			fmt.Printf("MSG: %v\n", string(msg.data))
 			wsMsg := new(websocketResponse)
 			err := json.Unmarshal(msg.data, wsMsg)
 			if err != nil {
@@ -184,8 +220,6 @@ func handleOrderRequests(ctx context.Context, conn *websocket.Conn, createOrderC
 					fmt.Println("error websocket error: shutting down order channel", err)
 					return
 				}
-
-				// TODO send open failed to all listening
 
 				if req, ok := requests[*wsMsg.InternalClientOrderId]; ok {
 					req.cb <- &createOrderResponse{err: fmt.Errorf("order failed to open: %v", *wsMsg.Message)}
@@ -204,16 +238,33 @@ func handleOrderRequests(ctx context.Context, conn *websocket.Conn, createOrderC
 				continue
 			}
 
-			if wsMsg.Order == nil {
-				fmt.Println("error processing order event. no order found: shutting down order channel")
+			order := new(Order)
+			err = json.Unmarshal(msg.data, order)
+			if err != nil {
+				fmt.Printf("error unmarshaling order: %v. shutting down order channel", err)
+				return
 			}
 
-			// TODO insert all getting ws here
+			toRemove := make([]int, 0)
+			for i, sub := range subscriptions {
+				select {
+				case <-sub.ctx.Done():
+					toRemove = append(toRemove, i)
+					close(sub.cb)
+				case sub.cb <- order:
+				}
+			}
 
-			if req, ok := requests[wsMsg.Order.InternalClientOrderId]; ok {
-				req.cb <- &createOrderResponse{order: wsMsg.Order}
+			// remove subscriptions
+			for _, idx := range toRemove {
+				subscriptions[idx] = subscriptions[len(subscriptions)-1]
+				subscriptions = subscriptions[:len(subscriptions)-1]
+			}
+
+			if req, ok := requests[order.InternalClientOrderId]; ok {
+				req.cb <- &createOrderResponse{order: order}
 				close(req.cb)
-				delete(requests, wsMsg.Order.InternalClientOrderId)
+				delete(requests, order.InternalClientOrderId)
 			}
 
 		case req := <-createOrderChan:
@@ -235,6 +286,13 @@ func handleOrderRequests(ctx context.Context, conn *websocket.Conn, createOrderC
 				close(req.cb)
 				continue
 			}
+		case sub := <-subscriptionChan:
+			if sub == nil {
+				fmt.Println("subscription channel closed")
+				return
+			}
+
+			subscriptions = append(subscriptions, sub)
 		}
 	}
 }
