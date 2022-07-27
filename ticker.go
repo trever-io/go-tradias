@@ -36,6 +36,9 @@ func (c *APIClient) GetTicker(ctx context.Context, baseAsset string, quoteAsset 
 	}
 
 	conn, err := c.connect(ctx, &sub)
+	if err != nil {
+		return nil, fmt.Errorf("error connecting to tradias: %w", err)
+	}
 
 	book, err := getLiquidityBookSnapshot(conn)
 	if err != nil {
